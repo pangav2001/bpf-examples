@@ -33,6 +33,8 @@
 #include <time.h>
 #include <unistd.h>
 #include <sched.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <xdp/xsk.h>
 #include <xdp/libxdp.h>
@@ -40,6 +42,8 @@
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "xdpsock.h"
+#include "/home/pgavriil/git/ubpf/vm/inc/ubpf.h"
+#include "lpm_trie.h"
 
 #ifndef SOL_XDP
 #define SOL_XDP 283
@@ -61,7 +65,7 @@
 #define SO_BUSY_POLL_BUDGET     70
 #endif
 
-#define NUM_FRAMES (4 * 1024)
+#define NUM_FRAMES (2 * 1024)
 #define MIN_PKT_SIZE 64
 
 #define DEBUG_HEXDUMP 0
@@ -128,7 +132,8 @@ static u32 opt_xdp_bind_flags = XDP_USE_NEED_WAKEUP;
 static u32 opt_umem_flags;
 static int opt_unaligned_chunks;
 static int opt_mmap_flags;
-static int opt_xsk_frame_size = XSK_UMEM__DEFAULT_FRAME_SIZE;
+// static int opt_xsk_frame_size = XSK_UMEM__DEFAULT_FRAME_SIZE;
+static int opt_xsk_frame_size = 2048;
 static int opt_timeout = 1000;
 static bool opt_need_wakeup = true;
 static u32 opt_num_xsks = 1;
@@ -140,6 +145,7 @@ static int opt_schpolicy = SCHED_OTHER;
 static int opt_schprio = SCHED_PRI__DEFAULT;
 static bool opt_tstamp;
 static struct xdp_program *xdp_prog;
+ubpf_jit_fn	fn;
 
 struct vlan_ethhdr {
 	unsigned char h_dest[6];
@@ -1695,9 +1701,12 @@ static void l2fwd(struct xsk_socket_info *xsk)
 		addr = xsk_umem__add_offset_to_addr(addr);
 		char *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
 
-		swap_mac_addresses(pkt);
+		uint64_t ubpf_ret;
+		ubpf_ret = fn((void *)pkt, len);
+		// printf("uBPF ret: %lu\n", ubpf_ret);
+		// swap_mac_addresses(pkt);
 
-		hex_dump(pkt, len, addr);
+		// hex_dump(pkt, len, addr);
 		xsk_ring_prod__tx_desc(&xsk->tx, idx_tx)->addr = orig;
 		xsk_ring_prod__tx_desc(&xsk->tx, idx_tx++)->len = len;
 	}
@@ -1709,8 +1718,78 @@ static void l2fwd(struct xsk_socket_info *xsk)
 	xsk->outstanding_tx += rcvd;
 }
 
+static int read_binary_file(const char *filename, uint8_t **buf, size_t *len) {
+    int fd = open(filename, O_RDONLY);
+    if (fd < 0) {
+        perror("open");
+        return -1;
+    }
+
+    off_t file_len = lseek(fd, 0, SEEK_END);
+    if (file_len == (off_t) -1) {
+        perror("lseek");
+        close(fd);
+        return -1;
+    }
+
+    *buf = malloc(file_len);
+    if (!*buf) {
+        perror("malloc");
+        close(fd);
+        return -1;
+    }
+
+    if (lseek(fd, 0, SEEK_SET) == (off_t) -1) {
+        perror("lseek");
+        free(*buf);
+        close(fd);
+        return -1;
+    }
+
+    ssize_t n = read(fd, *buf, file_len);
+    if (n < 0 || n != file_len) {
+        perror("read");
+        free(*buf);
+        close(fd);
+        return -1;
+    }
+
+    close(fd);
+    *len = n;
+
+    return 0;
+}
+#define BUFFER_SIZE 1024
+#define FILE_PATH "/home/pgavriil/git/ubpf/eBPF/redirect_uBPF.o"
 static void l2fwd_all(void)
 {
+	uint8_t *buf;
+	size_t buf_len;
+
+	if (read_binary_file(FILE_PATH, &buf, &buf_len
+	) != 0) {
+		fprintf(stderr, "Failed to read bytecode file\n");
+		return;
+	}
+
+	struct ubpf_vm *vm = ubpf_create();
+	if (!vm) {
+		fprintf(stderr, "Failed to create uBPF VM\n");
+		free(buf);
+		return;
+	}
+
+	char *errmsg;
+	int rv = ubpf_load_elf(vm, buf, buf_len, &errmsg);
+	if (rv < 0) {
+		fprintf(stderr, "Failed to load eBPF bytecode: %s\n", errmsg);
+		ubpf_destroy(vm);
+		free(buf);
+		return;
+	}
+
+	fn = ubpf_compile(vm, &errmsg);
+
 	struct pollfd fds[MAX_SOCKS] = {};
 	int i, ret;
 
