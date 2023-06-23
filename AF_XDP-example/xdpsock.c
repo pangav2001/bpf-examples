@@ -1989,7 +1989,97 @@ static void tx_only_all(void)
 	if (opt_pkt_count)
 		complete_tx_only_all();
 }
+// 90:e2:ba:f7:32:69
+unsigned char my_mac[] = {0x90, 0xe2, 0xba, 0xf7, 0x32, 0x69};
+// 90:E2:BA:F7:30:1D
+unsigned char source_mac[] = {0x90, 0xe2, 0xba, 0xf7, 0x30, 0x1d};
+// 90:E2:BA:F7:31:CD
+unsigned char target_mac[] = {0x90, 0xe2, 0xba, 0xf7, 0x31, 0xcd};
+void redirect(void *ctx, size_t len) {
+	void *data = (void *)(long)ctx;
+    void *data_end = (void *)(long)ctx + len;
+    struct ethhdr *eth = data;
+	// /* Check if eth header is within bounds */
+    if ((void *) (eth + 1) > data_end)
+    {
+		return;
+    }
+	if (eth->h_proto == htons(ETH_P_IP) 
+		|| eth->h_proto == htons(ETH_P_IPV6))
+	{
+		/* Check that source MAC is that of MoonGen sender
+           and destination MAC is that of the NIC running the XDP prog*/
+        if (!(memcmp(eth->h_source, source_mac, ETH_ALEN) 
+            || memcmp(eth->h_dest, my_mac, ETH_ALEN))) {
+            /* Swap MAC addresses as appropriate */
+            memcpy(eth->h_source, my_mac, ETH_ALEN);
+            memcpy(eth->h_dest, target_mac, ETH_ALEN);
+        }
+	}
+	return;
+}
+void standard_acl(void *ctx, size_t len) {
+	void *data = (void *)(long)ctx;
+    void *data_end = (void *)(long)ctx + len;
+    struct ethhdr *eth = data;
+	// /* Check if eth header is within bounds */
+    if ((void *) (eth + 1) > data_end)
+    {
+		return;
+    }
+	if (eth->h_proto == htons(ETH_P_IP) 
+		|| eth->h_proto == htons(ETH_P_IPV6))
+	{
+		int32_t permitted_src;
+		int32_t lookup;
+		if (eth->h_proto == htons(ETH_P_IP))
+		{
+			struct iphdr *iph;
+            __be32 src_ip;
+            /* Get the IP header */
+            iph = data + sizeof(struct ethhdr);
 
+            /* Check if IP header is within bounds */
+            if ((void *) iph + 1 > data_end)
+            {
+                return;
+            }
+            /* Get the source IP */
+            src_ip = iph->saddr;
+			lookup = trie_node_search(&ipv4_rules_trie, (uint8_t *)&src_ip, 32, &permitted_src);
+		}
+		else {
+			struct ipv6hdr *ipv6h;
+            struct in6_addr src_ip;
+            /* Get the IP header */
+            ipv6h = data + sizeof(struct ethhdr);
+
+            /* Check if IP header is within bounds */
+            if ((void *) ipv6h + 1 > data_end)
+            {
+                return;
+            }
+            /* Get the source IP */
+            src_ip = ipv6h->saddr;
+			lookup = trie_node_search(&ipv6_rules_trie, (uint8_t *)&src_ip, 128, &permitted_src);
+		}
+		if (lookup)
+		{
+			if (permitted_src)
+			{
+				/* Check that source MAC is that of MoonGen sender
+				and destination MAC is that of the NIC running the XDP prog*/
+				if (!(memcmp(eth->h_source, source_mac, ETH_ALEN) 
+					|| memcmp(eth->h_dest, my_mac, ETH_ALEN))) {
+					/* Swap MAC addresses as appropriate */
+					memcpy(eth->h_source, my_mac, ETH_ALEN);
+					memcpy(eth->h_dest, target_mac, ETH_ALEN);
+				}
+			}
+		}
+	}
+	return;
+}
 static void l2fwd(struct xsk_socket_info *xsk)
 {
 	unsigned int rcvd, i;
@@ -2028,10 +2118,13 @@ static void l2fwd(struct xsk_socket_info *xsk)
 		addr = xsk_umem__add_offset_to_addr(addr);
 		char *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
 
-		uint64_t ubpf_ret;
-		ubpf_ret = fn((void *)pkt, len);
+		// uint64_t ubpf_ret;
+		// ubpf_ret = fn((void *)pkt, len);
 		// printf("uBPF ret: %lu\n", ubpf_ret);
 		// swap_mac_addresses(pkt);
+
+		// redirect((void *)pkt, len);
+		standard_acl((void *)pkt, len);
 
 		// hex_dump(pkt, len, addr);
 		xsk_ring_prod__tx_desc(&xsk->tx, idx_tx)->addr = orig;
@@ -2092,7 +2185,6 @@ static int read_binary_file(const char *filename, uint8_t **buf, size_t *len) {
 
 static void l2fwd_all(void)
 {
-
 	trie_init(&ipv4_rules_trie);
 	trie_init(&ipv6_rules_trie);
     struct ipv4_lpm_key ipv4_key;
